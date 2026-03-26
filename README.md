@@ -108,7 +108,7 @@ nuitka --onefile --windows-console-mode=attach --enable-plugin=anti-bloat --jobs
 
 ---
 
-## 🐛 Исправленные баги (версия 2.0)
+## 🐛 Исправленные баги (версия 1.1)
 
 ### BUG 1: Исправлено определение редиректов
 **Проблема:** Все снапшоты ошибочно помечались как "External Redirect" из-за неправильной обработки Wayback Machine URL-оберток.
