@@ -14,6 +14,18 @@ Filter: Domain Rating >= 7  AND  Backlinks / Followed >= 10
 Output: final_results.xlsx  — only sites with final Topic == "Game" or "Business"
 """
 
+# PROXY SETUP:
+# Create a file named "proxies.txt" in the same folder as this script.
+# Add one proxy per line. Supported formats:
+#
+#   http://1.2.3.4:8080
+#   http://user:pass@1.2.3.4:8080
+#   socks5://1.2.3.4:1080
+#   socks5://user:pass@1.2.3.4:1080
+#
+# For SOCKS5 proxies, install: pip install requests[socks]
+# If proxies.txt does not exist, the script runs without proxy (direct connection).
+
 import re
 import sys
 import time
@@ -27,6 +39,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 import pickle
 import threading
+from urllib3.util.retry import Retry
 
 try:
     import waybackpy
@@ -114,15 +127,40 @@ MIN_DOMAIN_RATING = 7
 MIN_BL_FOLLOWED = 10  # Backlinks / Followed ratio
 
 SNAPSHOT_LIMIT = 200  # CDX snapshots per domain
-THREADS = 2  # lowered — Wayback Machine blocks too many parallel connections
-API_SLEEP = 0.5  # seconds before each CDX call (avoid 429)
-REQ_TIMEOUT = 45  # seconds — snapshot fetching timeout
-CDX_TIMEOUT = 60  # seconds — CDX API can be slower than snapshot fetching
-RETRY_ATTEMPTS = 3  # how many times to retry on connection error
+THREADS = 4  # outer: domains processed simultaneously (was 2)
+FETCH_THREADS = 2  # max simultaneous HTTP requests to web.archive.org per domain
+ANALYZE_THREADS = (
+    6  # CPU-bound HTML parsing threads per domain (no network — safe to go high)
+)
+API_SLEEP = 0.3  # seconds before each CDX call (avoid 429)
+REQ_TIMEOUT = 12  # seconds — snapshot fetching timeout
+CDX_TIMEOUT = 15  # seconds — CDX API can be slower than snapshot fetching
+RETRY_ATTEMPTS = 2  # how many times to retry on connection error
 RETRY_BACKOFF = 2  # exponential base: 2, 4, 8 seconds
 DOMAIN_TIME_BUDGET = (
-    120  # seconds — max time per domain before skipping remaining snapshots
+    60  # seconds — max time per domain before skipping remaining snapshots
 )
+
+# Rate limiting detection
+RATE_LIMIT_THRESHOLD = 3  # how many 429/503 responses trigger fallback
+RATE_LIMIT_WINDOW = 30  # seconds window to count rate limit hits
+JITTER_MIN = 0.05  # minimum random delay between requests (seconds)
+JITTER_MAX = 0.4  # maximum random delay between requests (seconds)
+
+# Keep-alive pool
+SESSION_POOL_SIZE = 3  # number of persistent keep-alive sessions to rotate
+
+# ---------------------------------------------------------------------------
+# Proxy configuration
+# ---------------------------------------------------------------------------
+PROXY_FILE = os.path.join(BASE_DIR, "proxies.txt")  # one proxy per line
+PROXY_ENABLED = os.path.exists(PROXY_FILE)  # auto-enabled if file exists and not empty
+
+# Proxy format in proxies.txt (one per line), supported formats:
+#   http://host:port
+#   http://user:password@host:port
+#   socks5://host:port
+#   socks5://user:password@host:port
 
 CDX_API = "https://web.archive.org/cdx/search/cdx"
 WB_FETCH = "https://web.archive.org/web/{ts}id_/{url}"
@@ -133,7 +171,7 @@ BASE_HEADERS = {
 }
 
 # Languages to keep (all others → skip snapshot / mark Bad)
-ALLOWED_LANGS = {"en", "de"}
+ALLOWED_LANGS = {"en", "de", "fr"}
 
 # Asian language codes that are hard signals for spam-drop
 ASIAN_LANGS = {"zh-cn", "zh-tw", "zh", "ja", "ko", "vi", "th"}
@@ -473,6 +511,195 @@ BAD_KEYWORDS = [
 ]
 
 
+# New topic keywords
+CHESS_KEYWORDS = [
+    "chess",
+    "chessgame",
+    "chess game",
+    "chessboard",
+    "chess board",
+    "chess pieces",
+    "chess set",
+    "chess tournament",
+    "chess championship",
+    "chess club",
+    "chess strategy",
+    "chess tactics",
+    "chess opening",
+    "chess endgame",
+    "chess middlegame",
+    "chess puzzles",
+    "chess analysis",
+    "chess engine",
+    "stockfish",
+    "chess.com",
+    "lichess",
+    "fide",
+    "grandmaster",
+    "gm chess",
+    "international master",
+    "chess rating",
+    "elo rating",
+    "blitz chess",
+    "rapid chess",
+    "bullet chess",
+    "chess960",
+    "fischer random",
+    "checkmate",
+    "stalemate",
+    "castling",
+    "en passant",
+    "chess notation",
+    "pgn",
+    "magnus carlsen",
+    "kasparov",
+    "chess olympiad",
+    "world chess championship",
+    "candidates tournament",
+    "chess news",
+    "chess lessons",
+    "chess training",
+    "chess software",
+    "arena chess",
+    "online chess",
+    "chess variants",
+    "crazyhouse",
+    "chess ladder",
+    "chess league",
+]
+
+DELIVERY_KEYWORDS = [
+    "delivery",
+    "deliveries",
+    "courier",
+    "shipping",
+    "shipment",
+    "logistics",
+    "parcel",
+    "package",
+    "dispatch",
+    "tracking",
+    "last mile",
+    "same day delivery",
+    "next day delivery",
+    "express delivery",
+    "overnight delivery",
+    "food delivery",
+    "grocery delivery",
+    "package delivery",
+    "freight",
+    "cargo",
+    "supply chain",
+    "fulfillment",
+    "warehouse",
+    "distribution",
+    "order tracking",
+    "track your order",
+    "track your package",
+    "doorstep delivery",
+    "on demand delivery",
+    "delivery app",
+    "delivery service",
+    "delivery platform",
+    "delivery network",
+    "uber eats",
+    "doordash",
+    "instacart",
+    "grubhub",
+    "deliveroo",
+    "just eat",
+    "glovo",
+    "bolt food",
+    "wolt",
+    "postmates",
+    "amazon logistics",
+    "fedex",
+    "ups",
+    "dhl",
+    "usps",
+    "postal service",
+    "mail delivery",
+    "drop shipping",
+    "dropshipping",
+    "delivery driver",
+    "delivery fee",
+    "free delivery",
+    "delivery zone",
+    "delivery time",
+    "estimated delivery",
+    "delivery schedule",
+]
+
+NEWS_KEYWORDS = [
+    "news",
+    "breaking news",
+    "latest news",
+    "top news",
+    "world news",
+    "local news",
+    "national news",
+    "international news",
+    "news today",
+    "headlines",
+    "headline",
+    "news article",
+    "news report",
+    "news coverage",
+    "news update",
+    "daily news",
+    "news feed",
+    "journalist",
+    "journalism",
+    "reporter",
+    "correspondent",
+    "editorial",
+    "op-ed",
+    "opinion piece",
+    "press release",
+    "newswire",
+    "wire service",
+    "ap news",
+    "reuters",
+    "afp",
+    "bbc news",
+    "cnn",
+    "fox news",
+    "msnbc",
+    "nbc news",
+    "abc news",
+    "the guardian",
+    "new york times",
+    "washington post",
+    "associated press",
+    "bloomberg news",
+    "news magazine",
+    "news portal",
+    "news site",
+    "news website",
+    "news aggregator",
+    "politics news",
+    "sports news",
+    "tech news",
+    "business news",
+    "entertainment news",
+    "science news",
+    "health news",
+    "weather news",
+    "stock market news",
+    "crypto news",
+    "investigative journalism",
+    "fact check",
+    "media outlet",
+    "press freedom",
+    "news anchor",
+    "news broadcast",
+    "news channel",
+    "breaking story",
+    "exclusive report",
+    "news desk",
+]
+
+
 def _make_pattern(words: list[str]) -> re.Pattern:
     return re.compile(
         r"\b(" + "|".join(map(re.escape, words)) + r")\b",
@@ -482,6 +709,9 @@ def _make_pattern(words: list[str]) -> re.Pattern:
 
 GAME_PAT = _make_pattern(GAME_KEYWORDS)
 BUSINESS_PAT = _make_pattern(BUSINESS_KEYWORDS)
+CHESS_PAT = _make_pattern(CHESS_KEYWORDS)
+DELIVERY_PAT = _make_pattern(DELIVERY_KEYWORDS)
+NEWS_PAT = _make_pattern(NEWS_KEYWORDS)
 BAD_PAT = _make_pattern(BAD_KEYWORDS)
 
 
@@ -511,18 +741,169 @@ def _url_domain(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTTP session (shared, with retry-safe adapter)
+# Proxy Manager
 # ---------------------------------------------------------------------------
-_session = requests.Session()
-_adapter = HTTPAdapter(max_retries=5)
-_session.mount("http://", _adapter)
-_session.mount("https://", _adapter)
-_session.headers.update(BASE_HEADERS)
+class _ProxyManager:
+    """
+    Loads proxies from PROXY_FILE and rotates them round-robin.
+    Tracks failed proxies and removes them after TOO_MANY_FAILS failures.
+    Automatically disables itself if no proxies remain.
+    """
+
+    TOO_MANY_FAILS = 3  # failures before a proxy is removed from rotation
+
+    def __init__(self):
+        self._proxies: list[str] = []
+        self._fails: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._cycle = None
+        self._load()
+
+    def _load(self):
+        if not PROXY_ENABLED:
+            log.info(
+                "proxies.txt not found — running without proxies (direct connection)"
+            )
+            return
+        try:
+            with open(PROXY_FILE, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+            if not lines:
+                log.info(
+                    "proxies.txt is empty — running without proxies (direct connection)"
+                )
+                return
+            self._proxies = lines
+            self._cycle = itertools.cycle(self._proxies)
+            log.info(f"Loaded {len(self._proxies)} proxies from {PROXY_FILE}")
+        except Exception as exc:
+            log.warning(f"Could not load proxy file: {exc} — running without proxies")
+
+    def get(self) -> dict | None:
+        """Return next proxy dict for requests, or None if no proxies available."""
+        with self._lock:
+            if not self._proxies:
+                return None
+            proxy_url = next(self._cycle)
+        return {"http": proxy_url, "https": proxy_url}
+
+    def report_fail(self, proxy_dict: dict | None):
+        """Report a failed proxy. Removes it after TOO_MANY_FAILS failures."""
+        if not proxy_dict:
+            return
+        proxy_url = proxy_dict.get("http", "")
+        with self._lock:
+            self._fails[proxy_url] = self._fails.get(proxy_url, 0) + 1
+            if self._fails[proxy_url] >= self.TOO_MANY_FAILS:
+                if proxy_url in self._proxies:
+                    self._proxies.remove(proxy_url)
+                    log.warning(
+                        f"[PROXY] Removed dead proxy after {self.TOO_MANY_FAILS} fails: {proxy_url}"
+                    )
+                    if self._proxies:
+                        self._cycle = itertools.cycle(self._proxies)
+                    else:
+                        self._cycle = None
+                        log.error(
+                            "[PROXY] All proxies exhausted — running without proxy"
+                        )
+
+    def report_success(self, proxy_dict: dict | None):
+        """Reset fail counter on success."""
+        if not proxy_dict:
+            return
+        proxy_url = proxy_dict.get("http", "")
+        with self._lock:
+            self._fails[proxy_url] = 0
+
+    @property
+    def available(self) -> bool:
+        return bool(self._proxies)
+
+
+_proxy_manager = _ProxyManager()
+
+
+# ---------------------------------------------------------------------------
+# HTTP session pool (shared, with retry-safe adapter and keep-alive)
+# ---------------------------------------------------------------------------
+import itertools
+
+
+def _build_session() -> requests.Session:
+    """Create a single persistent keep-alive session."""
+    retry = Retry(total=2, backoff_factor=1, status_forcelist=[429, 503])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=10)
+    s = requests.Session()
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update({**BASE_HEADERS, "Connection": "keep-alive"})
+    return s
+
+
+# Pool of persistent sessions
+_session_pool = [_build_session() for _ in range(SESSION_POOL_SIZE)]
+_session_pool_cycle = itertools.cycle(_session_pool)
+_session_pool_lock = threading.Lock()
+
+
+def _get_session() -> tuple[requests.Session, dict | None]:
+    """
+    Return (session, proxy_dict) from pool.
+    proxy_dict is None if proxy is disabled or exhausted.
+    """
+    with _session_pool_lock:
+        session = next(_session_pool_cycle)
+    proxy = _proxy_manager.get() if PROXY_ENABLED else None
+    return session, proxy
 
 
 def _make_headers() -> dict:
     """Return headers with a fresh random User-Agent for each request."""
     return {**BASE_HEADERS, "User-Agent": _random_ua()}
+
+
+# ---------------------------------------------------------------------------
+# Rate limit tracker
+# ---------------------------------------------------------------------------
+class _RateLimitTracker:
+    """Tracks 429/503 hits across all threads and signals when to slow down."""
+
+    def __init__(self):
+        self._hits: list[float] = []
+        self._lock = threading.Lock()
+        self.throttle_factor = 1.0  # multiplied into all sleep calls
+
+    def record_hit(self):
+        now = time.time()
+        with self._lock:
+            self._hits = [t for t in self._hits if now - t < RATE_LIMIT_WINDOW]
+            self._hits.append(now)
+            count = len(self._hits)
+
+        if count >= RATE_LIMIT_THRESHOLD:
+            # Exponential backoff on throttle factor, cap at 8x
+            self.throttle_factor = min(self.throttle_factor * 2.0, 8.0)
+            log.warning(
+                f"[RATE LIMIT] {count} hits in {RATE_LIMIT_WINDOW}s window — "
+                f"throttle_factor now {self.throttle_factor:.1f}x"
+            )
+        elif count == 0:
+            # Slowly recover when no hits
+            self.throttle_factor = max(self.throttle_factor * 0.9, 1.0)
+
+    def sleep(self, base: float):
+        """Sleep base * throttle_factor + random jitter."""
+        jitter = random.uniform(JITTER_MIN, JITTER_MAX)
+        total = base * self.throttle_factor + jitter
+        time.sleep(total)
+
+    @property
+    def is_throttled(self) -> bool:
+        return self.throttle_factor > 1.0
+
+
+_rate_tracker = _RateLimitTracker()
 
 
 # Sentinel: CDX returned a network-level error (not an empty archive)
@@ -566,12 +947,22 @@ def get_snapshots(domain: str):
             "limit": 1,
             "order": "timestamp asc",
         }
-        resp = _session.get(
-            CDX_API,
-            params=params_first,
-            timeout=CDX_TIMEOUT,
-            headers=_make_headers(),
-        )
+        session, proxy = _get_session()
+        try:
+            resp = session.get(
+                CDX_API,
+                params=params_first,
+                timeout=CDX_TIMEOUT,
+                headers=_make_headers(),
+                proxies=proxy,
+            )
+            _proxy_manager.report_success(proxy)
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            _proxy_manager.report_fail(proxy)
+            raise
         if resp.status_code == 200:
             data = resp.json()
             if data and len(data) >= 2:
@@ -583,7 +974,7 @@ def get_snapshots(domain: str):
             f"  {domain}: Could not determine first year, using {first_year}: {exc}"
         )
 
-    time.sleep(API_SLEEP)
+    _rate_tracker.sleep(API_SLEEP)
 
     # Step B: Calculate dynamic limit based on year span
     current_year = datetime.now().year
@@ -617,19 +1008,31 @@ def get_snapshots(domain: str):
 
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
-                resp = _session.get(
-                    CDX_API,
-                    params=params,
-                    timeout=CDX_TIMEOUT,
-                    headers=_make_headers(),
-                )
+                session, proxy = _get_session()
+                try:
+                    resp = session.get(
+                        CDX_API,
+                        params=params,
+                        timeout=CDX_TIMEOUT,
+                        headers=_make_headers(),
+                        proxies=proxy,
+                    )
+                    _proxy_manager.report_success(proxy)
+                except (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                ) as exc:
+                    _proxy_manager.report_fail(proxy)
+                    raise
                 if resp.status_code in (429, 503):
+                    _rate_tracker.record_hit()
+                    _proxy_manager.report_fail(proxy)
                     wait = 10 * attempt
                     log.warning(
                         f"  CDX {resp.status_code} for {domain} year {year} "
                         f"(attempt {attempt}/{RETRY_ATTEMPTS}), sleeping {wait}s"
                     )
-                    time.sleep(wait)
+                    _rate_tracker.sleep(wait)
                     continue
                 resp.raise_for_status()
                 data = resp.json()
@@ -659,7 +1062,7 @@ def get_snapshots(domain: str):
                 total_failures += 1
                 break
 
-        time.sleep(API_SLEEP)
+        _rate_tracker.sleep(API_SLEEP)
 
     # If every year failed with network errors and we got no data at all
     if not all_snapshots and total_failures == (current_year - first_year + 1):
@@ -674,6 +1077,24 @@ def get_snapshots(domain: str):
         _cdx_cache[domain] = result
 
     return result
+
+
+def _prefetch_cdx_worker(domain_queue, result_dict: dict, stop_event: threading.Event):
+    """
+    Background worker: continuously pulls domains from domain_queue,
+    fetches their CDX snapshots, stores results in result_dict.
+    Stops when stop_event is set or queue is empty.
+    """
+    import queue
+
+    while not stop_event.is_set():
+        try:
+            domain = domain_queue.get(timeout=2)
+        except queue.Empty:
+            break
+        if domain not in result_dict:
+            result_dict[domain] = get_snapshots(domain)
+        domain_queue.task_done()
 
 
 # ---------------------------------------------------------------------------
@@ -744,20 +1165,32 @@ def fetch_snapshot(
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            resp = _session.get(
-                fetch_url,
-                timeout=REQ_TIMEOUT,
-                allow_redirects=True,
-                headers=_make_headers(),
-            )
+            session, proxy = _get_session()
+            try:
+                resp = session.get(
+                    fetch_url,
+                    timeout=REQ_TIMEOUT,
+                    allow_redirects=True,
+                    headers=_make_headers(),
+                    proxies=proxy,
+                )
+                _proxy_manager.report_success(proxy)
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as exc:
+                _proxy_manager.report_fail(proxy)
+                raise
 
             if resp.status_code in (429, 503):
+                _rate_tracker.record_hit()
+                _proxy_manager.report_fail(proxy)
                 wait = 10 * attempt
                 log.warning(
                     f"  Fetch {resp.status_code} for {target_domain} "
                     f"(attempt {attempt}/{RETRY_ATTEMPTS}), sleeping {wait}s"
                 )
-                time.sleep(wait)
+                _rate_tracker.sleep(wait)
                 continue
 
             resp.raise_for_status()
@@ -926,11 +1359,20 @@ def classify_snapshot(html: str, target_base: str) -> tuple[str, str, str]:
     # Topic scoring
     game_score = _weighted_count(GAME_PAT, zones)
     biz_score = _weighted_count(BUSINESS_PAT, zones)
+    chess_score = _weighted_count(CHESS_PAT, zones)
+    delivery_score = _weighted_count(DELIVERY_PAT, zones)
+    news_score = _weighted_count(NEWS_PAT, zones)
 
-    if game_score > 0 and game_score >= biz_score:
-        return "Game", language, zones["body"]
-    if biz_score > 0:
-        return "Business", language, zones["body"]
+    scores = {
+        "Game": game_score,
+        "Business": biz_score,
+        "Chess": chess_score,
+        "Delivery": delivery_score,
+        "News": news_score,
+    }
+    best_topic, best_score = max(scores.items(), key=lambda x: x[1])
+    if best_score > 0:
+        return best_topic, language, zones["body"]
     return "Other", language, zones["body"]
 
 
@@ -959,7 +1401,7 @@ def analyze_domain(domain: str) -> dict:
     }
 
     # Step 1: CDX (Level 1)
-    time.sleep(API_SLEEP)
+    _rate_tracker.sleep(API_SLEEP)
     success_level = 1
     snapshots = get_snapshots(domain)
 
@@ -973,7 +1415,7 @@ def analyze_domain(domain: str) -> dict:
 
         # Level 2
         log.warning(f"[LEVEL 2] CDX не ответил, пробую Waybackpy для {domain}...")
-        time.sleep(20)
+        time.sleep(3)
         success_level = 2
         try:
             wb = waybackpy.Url(domain, _random_ua())
@@ -989,7 +1431,7 @@ def analyze_domain(domain: str) -> dict:
             log.warning(
                 f"[LEVEL 3] Waybackpy не справился, пробую официальный Wayback Client для {domain}..."
             )
-            time.sleep(20)
+            time.sleep(3)
             success_level = 3
             try:
                 client = wayback.WaybackClient()
@@ -1024,88 +1466,108 @@ def analyze_domain(domain: str) -> dict:
     # Early stop event for parallel processing
     early_stop = threading.Event()
 
-    # Process snapshots in parallel with inner thread pool
-    def process_snapshot(ts: str, orig_url: str):
-        """Process a single snapshot and return result tuple."""
+    def fetch_only(ts: str, orig_url: str):
+        """Phase 1: Fetch HTML from Wayback Machine.
+        Returns (ts, html, redirect_note, skip_reason).
+        If skipped, html is None and skip_reason is set.
+        """
         if early_stop.is_set():
-            return None
+            return (ts, None, None, None)
 
         # Check time budget
         elapsed = time.time() - start_time
         if elapsed > DOMAIN_TIME_BUDGET:
-            log.warning(
-                f"  {domain}: Time budget exceeded ({elapsed:.1f}s), skipping remaining snapshots"
-            )
-            early_stop.set()
-            return None
+            return (ts, None, None, f"Time budget exceeded ({elapsed:.1f}s)")
 
         date_str = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}"
 
-        # Step 2: URL character check
+        # URL character check
         if not _url_is_clean(orig_url):
-            reason = "Non-ASCII URL"
-            return (ts, None, None, None, f"{date_str}: {reason}", None)
+            return (ts, None, None, f"{date_str}: Non-ASCII URL")
 
-        # Step 3: Fetch + redirect check
+        # Fetch snapshot
         html, redirect_note = fetch_snapshot(target, ts, orig_url)
         if html is None:
-            return (ts, None, None, None, f"{date_str}: {redirect_note}", None)
+            return (ts, None, None, f"{date_str}: {redirect_note}")
 
-        # Step 4 & 5: Classify (language + bad-keyword + topic)
+        return (ts, html, redirect_note, None)
+
+    def analyze_only(html: str, ts: str, target_base: str):
+        """Phase 2: Analyze HTML content (CPU-bound, no network).
+        Returns (ts, topic, lang, body) or filtered result.
+        """
         topic, lang, body = classify_snapshot(html, target_base)
 
+        date_str = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}"
+
+        # Handle special cases that should be treated as skip reasons
         if topic == "Meta Refresh Redirect":
-            return (ts, None, None, None, f"{date_str}: Meta Refresh Redirect", None)
+            return (ts, None, None, None, f"{date_str}: Meta Refresh Redirect")
 
         if topic == "Empty/Parked":
-            return (
-                ts,
-                None,
-                None,
-                None,
-                f"{date_str}: Empty or Parked (<400 chars)",
-                None,
-            )
+            return (ts, None, None, None, f"{date_str}: Empty or Parked (<400 chars)")
 
-        return (ts, topic, lang, body, None, redirect_note)
+        return (ts, topic, lang, body, None)
 
-    # Use inner thread pool for parallel snapshot fetching
-    snapshot_results = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    # Phase 1: Fetch all snapshots (max 2 concurrent requests to Wayback)
+    fetched_snapshots = []
+    with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
         future_to_snapshot = {
-            executor.submit(process_snapshot, ts, url): (ts, url)
-            for ts, url in snapshots
+            executor.submit(fetch_only, ts, url): (ts, url) for ts, url in snapshots
         }
 
         for future in as_completed(future_to_snapshot):
             if early_stop.is_set():
                 break
 
-            result = future.result()
-            if result is None:
-                continue
-
-            ts, topic, lang, body, skip_reason, redirect_note = result
+            ts, html, redirect_note, skip_reason = future.result()
 
             if skip_reason:
                 skip_reasons.append(skip_reason)
                 continue
 
-            # Store result with timestamp for sorting
-            snapshot_results.append((ts, topic, lang, body, redirect_note))
+            if html is not None:
+                fetched_snapshots.append((ts, html, redirect_note))
 
-            # Check early stop conditions
-            temp_votes = [r[1] for r in snapshot_results]
-            game_count = temp_votes.count("Game")
-            biz_count = temp_votes.count("Business")
-            bad_count = sum(1 for t in temp_votes if t in ("Wrong Language", "Bad"))
+    # Phase 2: Analyze all fetched HTMLs (max 6 concurrent, pure CPU)
+    snapshot_results = []
+    with ThreadPoolExecutor(max_workers=ANALYZE_THREADS) as executor:
+        future_to_html = {
+            executor.submit(analyze_only, html, ts, target_base): (
+                ts,
+                html,
+                redirect_note,
+            )
+            for ts, html, redirect_note in fetched_snapshots
+        }
 
-            if game_count >= 3 or biz_count >= 3 or bad_count >= 3:
-                log.info(
-                    f"[EARLY STOP] {domain} after {len(snapshot_results)} snapshots (game={game_count}, biz={biz_count}, bad={bad_count})"
+        for future in as_completed(future_to_html):
+            result = future.result()
+            if result is None:
+                continue
+
+            ts, topic, lang, body, skip_reason = result
+
+            if skip_reason:
+                skip_reasons.append(skip_reason)
+                continue
+
+            if topic is not None:  # Only add if topic was successfully classified
+                # Get redirect_note from original fetch
+                redirect_note = next(
+                    (rn for t, h, rn in fetched_snapshots if t == ts), None
                 )
-                early_stop.set()
-                break
+                snapshot_results.append((ts, topic, lang, body, redirect_note))
+
+    # Check early stop after Phase 2 (only for bad content, not valid topics)
+    temp_votes = [r[1] for r in snapshot_results]
+    bad_count = sum(1 for t in temp_votes if t in ("Wrong Language", "Bad"))
+
+    if bad_count >= 3:
+        log.info(
+            f"[EARLY STOP] {domain} after {len(snapshot_results)} snapshots — bad_count={bad_count}"
+        )
+        # Don't set early_stop here since phases are already complete, just continue with what we have
 
     # Sort results by timestamp to preserve order
     snapshot_results.sort(key=lambda x: x[0])
@@ -1164,18 +1626,18 @@ def analyze_domain(domain: str) -> dict:
         return base_result
 
     # Priority Vote + Veto Override
-    game_count = votes.count("Game")
-    biz_count = votes.count("Business")
+    VALID_TOPICS = {"Game", "Business", "Chess", "Delivery", "News"}
 
     if has_bad_snapshot:
-        # VETO: if the site ever hosted bad/wrong language content, deny it completely
         final_topic = "Bad"
-    elif game_count >= 2 and game_count >= biz_count:
-        final_topic = "Game"
-    elif biz_count >= 2:
-        final_topic = "Business"
     else:
-        final_topic = max(set(votes), key=votes.count)
+        topic_counts = {t: votes.count(t) for t in VALID_TOPICS}
+        best_topic = max(topic_counts, key=topic_counts.get)
+        best_count = topic_counts[best_topic]
+        if best_count >= 2:
+            final_topic = best_topic
+        else:
+            final_topic = max(set(votes), key=votes.count)
 
     final_lang = max(set(langs), key=langs.count)
 
@@ -1210,6 +1672,22 @@ def analyze_domain(domain: str) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    # Check socks support if socks proxies are configured
+    if PROXY_ENABLED:
+        try:
+            with open(PROXY_FILE) as f:
+                content = f.read()
+            if "socks" in content.lower():
+                try:
+                    import socks  # noqa
+                except ImportError:
+                    log.warning(
+                        "SOCKS proxies detected in proxies.txt but 'requests[socks]' is not installed. "
+                        "Run: pip install requests[socks]"
+                    )
+        except Exception:
+            pass
+
     # 1. Read & filter Excel
     log.info(f"Reading {INPUT_FILE} …")
     df = pd.read_excel(INPUT_FILE)
@@ -1310,7 +1788,26 @@ def main():
     if not domains_to_process:
         log.info("All domains already processed. Skipping analysis.")
     else:
-        # 2. Parallel analysis
+        # 2. CDX prefetch (background)
+        import queue as _queue
+
+        log.info("Starting CDX prefetch for all domains...")
+        _cdx_prefetch_queue = _queue.Queue()
+        for d in domains_to_process:
+            _cdx_prefetch_queue.put(d)
+
+        _cdx_stop = threading.Event()
+        _cdx_prefetch_threads = []
+        for _ in range(min(FETCH_THREADS, 2)):  # max 2 CDX prefetch threads
+            t = threading.Thread(
+                target=_prefetch_cdx_worker,
+                args=(_cdx_prefetch_queue, _cdx_cache, _cdx_stop),
+                daemon=True,
+            )
+            t.start()
+            _cdx_prefetch_threads.append(t)
+
+        # 3. Parallel analysis
         log.info(f"Launching {THREADS} worker threads …")
         cache_lock = threading.Lock()
 
@@ -1321,7 +1818,7 @@ def main():
             for future in as_completed(future_map):
                 domain = future_map[future]
                 try:
-                    result = future.result()
+                    result = future.result(timeout=90)
                     analysis[domain] = result
 
                     # Immediately save to cache file
@@ -1332,6 +1829,18 @@ def main():
                         except Exception as exc:
                             log.warning(f"Could not save cache file: {exc}")
 
+                except TimeoutError:
+                    log.warning(f"[TIMEOUT] {domain} — forced skip after 90s")
+                    analysis[domain] = {
+                        "Domain": domain,
+                        "Topic": "Timeout",
+                        "Language": "unknown",
+                        "Snapshots_analyzed": 0,
+                        "Snapshots_skipped": 0,
+                        "Skip_reasons": "Global timeout 90s",
+                        "Frozen": "No",
+                        "Success_Level": 0,
+                    }
                 except Exception as exc:
                     log.error(f"Unhandled error for {domain}: {exc}")
                     analysis[domain] = {
@@ -1343,7 +1852,12 @@ def main():
                         "Skip_reasons": str(exc),
                     }
 
-    # 3. Merge results
+        # Stop prefetch threads
+        _cdx_stop.set()
+        for t in _cdx_prefetch_threads:
+            t.join(timeout=5)
+
+    # 4. Merge results
     def _get(d, key):
         # Must normalize Excel domain to match analysis dictionary keys
         normalized_key = _normalize_domain(str(d))
@@ -1364,16 +1878,16 @@ def main():
     unique_topics = tuple(filtered["Topic"].unique())
     log.info(f"Detected topics in dataframe: {unique_topics}")
 
-    # 4. Save final: only Game or Business (case-insensitive check)
-    final = filtered[filtered["Topic"].str.lower().isin(["game", "business"])].copy()
+    KEEP_TOPICS = {"game", "business", "chess", "delivery", "news"}
+    final = filtered[filtered["Topic"].str.lower().isin(KEEP_TOPICS)].copy()
 
     if final.empty:
-        log.warning("No sites matched 'Game' or 'Business' after analysis.")
+        log.warning("No sites matched valid topics after analysis.")
         log.warning(
             f"Debug: Top 5 rows of merged table:\n{filtered[[col_domain, 'Topic']].head(5).to_string()}"
         )
     else:
-        log.info(f"Saving {len(final)} sites (Topic=Game|Business) to {OUTPUT_FILE} …")
+        log.info(f"Saving {len(final)} sites to {OUTPUT_FILE} …")
         final.to_excel(OUTPUT_FILE, index=False)
 
         # Delete cache file after successful save
